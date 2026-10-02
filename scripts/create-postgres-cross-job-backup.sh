@@ -29,16 +29,9 @@ for _ in $(seq 1 90); do
 done
 docker exec backup-source pg_isready -U postgres >/dev/null
 
-docker exec backup-source psql -U postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
-CREATE TABLE public.backup_probe(
-  id integer PRIMARY KEY,
-  tenant_id text NOT NULL,
-  marker text NOT NULL
-);
-INSERT INTO public.backup_probe(id, tenant_id, marker) VALUES
-  (1, 'TENANT_ALPHA', 'alpha-backup-row'),
-  (2, 'TENANT_BETA', 'beta-backup-row');
-SQL
+docker exec backup-source psql -U postgres -q -v ON_ERROR_STOP=1 -c "CREATE TABLE public.backup_probe(id integer PRIMARY KEY, tenant_id text NOT NULL, marker text NOT NULL); INSERT INTO public.backup_probe(id, tenant_id, marker) VALUES (1, 'TENANT_ALPHA', 'alpha-backup-row'), (2, 'TENANT_BETA', 'beta-backup-row');" >/dev/null
+test "$(docker exec backup-source psql -U postgres -qAt -c "select count(*) from public.backup_probe;")" = "2"
+echo "CROSS_JOB_SOURCE_DATA_READY_RC=0"
 
 EXPECTED_ROWS="$(docker exec backup-source psql -U postgres -qAt -F '|' -c "select id,tenant_id,marker from public.backup_probe order by id;")"
 printf '%s\n' "$EXPECTED_ROWS" > "$OUTDIR/expected_rows.txt"
