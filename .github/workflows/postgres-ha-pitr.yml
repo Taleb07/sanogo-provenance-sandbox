@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sanogo-postgres-ha-pitr-main
+  cancel-in-progress: true
+
 jobs:
   postgres-ha-pitr:
     name: postgres-ha-pitr
