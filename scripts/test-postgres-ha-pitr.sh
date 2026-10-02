@@ -132,13 +132,20 @@ echo "=== PITR: start archive-enabled primary ==="
 docker run -d --name pitr-primary --network "$NET" --read-only --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID --pids-limit 256 --memory 512m --cpus 1 -e POSTGRES_PASSWORD_FILE=/run/secrets/db_password -e POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256" -v sanogo-pitr-primary:/var/lib/postgresql/data -v sanogo-pitr-archive:/archive -v "$DB_SECRET:/run/secrets/db_password:ro" --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --tmpfs /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m "$PG_IMAGE" postgres -c wal_level=replica -c archive_mode=on -c archive_timeout=1 -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
 wait_pg pitr-primary
 
+docker exec -i pitr-primary psql -U postgres -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '$REPL_PASS';
+SQL
+docker exec pitr-primary sh -ceu 'printf "%s\n" "host replication replicator 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"'
+docker exec pitr-primary psql -U postgres -v ON_ERROR_STOP=1 -c "select pg_reload_conf();" >/dev/null
+echo "PITR_REPLICATION_ROLE_RC=0"
+
 docker exec pitr-primary psql -U postgres -q -v ON_ERROR_STOP=1 -c "CREATE TABLE public.pitr_probe(id integer primary key, marker text not null); INSERT INTO public.pitr_probe VALUES (1,'keep-before-target'); CHECKPOINT;" >/dev/null
 PITR_PRIMARY_MARKER="$(docker exec pitr-primary psql -U postgres -qAt -v ON_ERROR_STOP=1 -c "SELECT marker FROM public.pitr_probe WHERE id=1;")"
 test "$PITR_PRIMARY_MARKER" = "keep-before-target"
 echo "PITR_PRIMARY_PROBE_WRITE_RC=0"
 
 echo "=== PITR: take physical base backup ==="
-printf 'pitr-primary:*:*:postgres:%s\n' "$DB_PASS" | docker run --rm -i --network "$NET" --user postgres --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1m,mode=1777 -e PGPASSFILE=/tmp/pgpass -v sanogo-pitr-base:/var/lib/postgresql/data "$PG_IMAGE" sh -ceu 'umask 077; cat > /tmp/pgpass; pg_basebackup -h pitr-primary -U postgres -D /var/lib/postgresql/data -Fp -Xs -P' >/dev/null
+printf 'pitr-primary:*:*:replicator:%s\n' "$REPL_PASS" | docker run --rm -i --network "$NET" --user postgres --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1m,mode=1777 -e PGPASSFILE=/tmp/pgpass -v sanogo-pitr-base:/var/lib/postgresql/data "$PG_IMAGE" sh -ceu 'umask 077; cat > /tmp/pgpass; pg_basebackup -h pitr-primary -U replicator -D /var/lib/postgresql/data -Fp -Xs -P' >/dev/null
 
 TARGET_TIME="$(docker exec pitr-primary psql -U postgres -Atqc "select clock_timestamp();")"
 sleep 2
