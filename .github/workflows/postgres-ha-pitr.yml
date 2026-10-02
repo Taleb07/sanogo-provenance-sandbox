@@ -1,0 +1,65 @@
+name: SANOGO PostgreSQL HA PITR Sandbox
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/test-postgres-ha-pitr.sh
+      - .github/workflows/postgres-ha-pitr.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-ha-pitr:
+    name: postgres-ha-pitr
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          sha256sum scripts/test-postgres-ha-pitr.sh .github/workflows/postgres-ha-pitr.yml
+
+      - name: Run PostgreSQL streaming replication failover and PITR tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-postgres-ha-pitr.sh | tee postgres-ha-pitr.log
+
+      - name: Build evidence summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp postgres-ha-pitr.log evidence/postgres-ha-pitr.log 2>/dev/null || true
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "commit=$GITHUB_SHA"
+            echo "workflow=$GITHUB_WORKFLOW_REF"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "postgres_image=postgres@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
+          } > evidence/context.txt
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+
+      - name: Upload database HA PITR evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-ha-pitr-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
