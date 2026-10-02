@@ -1,0 +1,303 @@
+name: SANOGO Registry Promotion
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - artifact.txt
+      - Containerfile
+      - .github/workflows/registry-promotion.yml
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/taleb07/sanogo-provenance-sandbox
+  BUILD_TAG: build-${{ github.sha }}
+  STAGING_TAG: staging
+
+jobs:
+  build-publish:
+    name: build-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      digest: ${{ steps.subject.outputs.digest }}
+
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify source identity and cleanliness
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          sha256sum artifact.txt Containerfile .github/workflows/registry-promotion.yml
+
+      - name: Login to GHCR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build once and push immutable build tag
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx version
+          docker buildx build             --platform linux/amd64             --file Containerfile             --tag "$IMAGE:$BUILD_TAG"             --provenance=false             --sbom=false             --push             --metadata-file build-metadata.json             .
+
+          DIGEST="$(jq -r '."containerimage.digest"' build-metadata.json)"
+          test -n "$DIGEST"
+          test "$DIGEST" != "null"
+          case "$DIGEST" in sha256:*) ;; *) exit 21 ;; esac
+
+          REMOTE_DIGEST="$(docker buildx imagetools inspect "$IMAGE:$BUILD_TAG" | awk '$1=="Digest:" {print $2; exit}')"
+          test "$REMOTE_DIGEST" = "$DIGEST"
+
+          echo "REGISTRY_BUILD_DIGEST=$DIGEST"
+          echo "REGISTRY_BUILD_DIGEST_BINDING_RC=0"
+
+      - name: Generate SPDX SBOM bound to image digest and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST="$(jq -r '."containerimage.digest"' build-metadata.json)"
+          DIGEST_HEX="${DIGEST#sha256:}"
+          SOURCE_SHA256="$(sha256sum artifact.txt | awk '{print $1}')"
+          SOURCE_SHA1="$(sha1sum artifact.txt | awk '{print $1}')"
+          PVC="$(printf '%s' "$SOURCE_SHA1" | sha1sum | awk '{print $1}')"
+
+          jq -n             --arg digest "$DIGEST_HEX"             --arg source256 "$SOURCE_SHA256"             --arg source1 "$SOURCE_SHA1"             --arg pvc "$PVC"             --arg commit "$GITHUB_SHA"             '{
+              spdxVersion: "SPDX-2.3",
+              dataLicense: "CC0-1.0",
+              SPDXID: "SPDXRef-DOCUMENT",
+              name: "SANOGO-registry-image-SBOM",
+              documentNamespace: ("https://sanogo.invalid/spdx/registry/" + $commit + "/" + $digest),
+              creationInfo: {
+                created: "1970-01-01T00:00:00Z",
+                creators: ["Tool: SANOGO Registry Promotion"]
+              },
+              packages: [{
+                name: "sanogo-provenance-sandbox-image",
+                SPDXID: "SPDXRef-Package",
+                versionInfo: $commit,
+                downloadLocation: "NOASSERTION",
+                filesAnalyzed: true,
+                packageVerificationCode: {packageVerificationCodeValue: $pvc},
+                checksums: [{algorithm: "SHA256", checksumValue: $digest}],
+                licenseConcluded: "NOASSERTION",
+                licenseDeclared: "NOASSERTION",
+                copyrightText: "NOASSERTION"
+              }],
+              files: [{
+                fileName: "./artifact.txt",
+                SPDXID: "SPDXRef-File-artifact",
+                checksums: [
+                  {algorithm: "SHA1", checksumValue: $source1},
+                  {algorithm: "SHA256", checksumValue: $source256}
+                ],
+                licenseConcluded: "NOASSERTION",
+                copyrightText: "NOASSERTION"
+              }],
+              relationships: [
+                {
+                  spdxElementId: "SPDXRef-DOCUMENT",
+                  relationshipType: "DESCRIBES",
+                  relatedSpdxElement: "SPDXRef-Package"
+                },
+                {
+                  spdxElementId: "SPDXRef-Package",
+                  relationshipType: "CONTAINS",
+                  relatedSpdxElement: "SPDXRef-File-artifact"
+                }
+              ]
+            }' > sbom.spdx.json
+
+          jq empty sbom.spdx.json
+          SBOM_IMAGE_SHA="$(jq -r '.packages[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' sbom.spdx.json)"
+          SBOM_SOURCE_SHA="$(jq -r '.files[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' sbom.spdx.json)"
+          test "$SBOM_IMAGE_SHA" = "$DIGEST_HEX"
+          test "$SBOM_SOURCE_SHA" = "$SOURCE_SHA256"
+
+          echo "REGISTRY_SBOM_IMAGE_BINDING_RC=0"
+          echo "REGISTRY_SBOM_SOURCE_BINDING_RC=0"
+
+      - name: Export immutable image subject
+        id: subject
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST="$(jq -r '."containerimage.digest"' build-metadata.json)"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate registry provenance attestation
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.subject.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate registry SBOM attestation
+        id: sbom-attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.subject.outputs.digest }}
+          sbom-path: ${{ github.workspace }}/sbom.spdx.json
+          push-to-registry: true
+
+      - name: Verify build provenance before eligibility for promotion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.subject.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          gh attestation verify             "oci://$IMAGE@$DIGEST"             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/registry-promotion.yml"             > evidence/build-provenance-verification.json
+
+          jq -e 'length > 0' evidence/build-provenance-verification.json >/dev/null
+          echo "REGISTRY_BUILD_PROVENANCE_VERIFY_RC=0"
+
+      - name: Verify registry SBOM attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.subject.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify             "oci://$IMAGE@$DIGEST"             --repo "$GITHUB_REPOSITORY"             --predicate-type https://spdx.dev/Document/v2.3             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/registry-promotion.yml"             > evidence/build-sbom-verification.json
+
+          jq -e 'length > 0' evidence/build-sbom-verification.json >/dev/null
+          echo "REGISTRY_BUILD_SBOM_VERIFY_RC=0"
+
+      - name: Upload build evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-build-evidence
+          path: |
+            build-metadata.json
+            sbom.spdx.json
+            evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+  promote-staging:
+    name: promote-staging
+    needs: build-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DIGEST: ${{ needs.build-publish.outputs.digest }}
+
+    steps:
+      - name: Login to GHCR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Enforce provenance gate before promotion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+
+          gh attestation verify             "oci://$IMAGE@$DIGEST"             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/registry-promotion.yml"             > evidence/pre-promotion-provenance.json
+
+          jq -e 'length > 0' evidence/pre-promotion-provenance.json >/dev/null
+          echo "PRE_PROMOTION_ATTESTATION_GATE_RC=0"
+
+      - name: Prove wrong workflow identity cannot satisfy promotion gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +e
+          gh attestation verify             "oci://$IMAGE@$DIGEST"             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/not-authorized.yml"             > evidence/wrong-workflow.txt 2>&1
+          RC=$?
+          set -e
+
+          echo "PRE_PROMOTION_WRONG_WORKFLOW_RC=$RC"
+          test "$RC" -ne 0
+
+      - name: Promote exact digest to staging without rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE@$DIGEST"
+          docker tag "$IMAGE@$DIGEST" "$IMAGE:$STAGING_TAG"
+          docker push "$IMAGE:$STAGING_TAG" | tee evidence/promotion-push.txt
+
+          STAGING_DIGEST="$(docker buildx imagetools inspect "$IMAGE:$STAGING_TAG" | awk '$1=="Digest:" {print $2; exit}')"
+          test "$STAGING_DIGEST" = "$DIGEST"
+
+          echo "BUILD_DIGEST=$DIGEST"
+          echo "STAGING_DIGEST=$STAGING_DIGEST"
+          echo "PROMOTION_WITHOUT_REBUILD_RC=0"
+
+      - name: Verify attestation through promoted staging tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify             "oci://$IMAGE:$STAGING_TAG"             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/registry-promotion.yml"             > evidence/staging-provenance-verification.json
+
+          jq -e 'length > 0' evidence/staging-provenance-verification.json >/dev/null
+          echo "STAGING_ATTESTATION_VERIFY_RC=0"
+
+      - name: Record promotion evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGING_DIGEST="$(docker buildx imagetools inspect "$IMAGE:$STAGING_TAG" | awk '$1=="Digest:" {print $2; exit}')"
+
+          jq -n             --arg repository "$GITHUB_REPOSITORY"             --arg commit "$GITHUB_SHA"             --arg image "$IMAGE"             --arg build_tag "$BUILD_TAG"             --arg staging_tag "$STAGING_TAG"             --arg build_digest "$DIGEST"             --arg staging_digest "$STAGING_DIGEST"             '{
+              repository: $repository,
+              commit: $commit,
+              image: $image,
+              build_tag: $build_tag,
+              staging_tag: $staging_tag,
+              build_digest: $build_digest,
+              staging_digest: $staging_digest,
+              promotion_without_rebuild: ($build_digest == $staging_digest),
+              provenance_gate_before_promotion: true,
+              build_job_has_attestation_write: true,
+              promotion_job_has_attestation_write: false,
+              production_deployment_performed: false,
+              synthetic_only: true
+            }' > evidence/promotion-evidence.json
+
+          jq -e '.promotion_without_rebuild == true' evidence/promotion-evidence.json >/dev/null
+          cat evidence/promotion-evidence.json
+
+      - name: Upload promotion evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-promotion-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
