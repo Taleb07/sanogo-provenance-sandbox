@@ -61,8 +61,8 @@ SQL
 
 docker exec ha-primary sh -ceu '
   printf "%s\n" "host replication replicator 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
-  pg_ctl reload -D "$PGDATA"
 '
+docker exec ha-primary psql -U postgres -v ON_ERROR_STOP=1 -c "select pg_reload_conf();" >/dev/null
 
 echo "=== HA: clone standby from primary ==="
 docker run --rm   --network "$NET"   --user postgres   -e PGPASSFILE=/run/secrets/pgpass   -v sanogo-ha-standby:/var/lib/postgresql/data   -v "$PGPASS_REPL:/run/secrets/pgpass:ro"   "$PG_IMAGE"   pg_basebackup     -h ha-primary     -U replicator     -D /var/lib/postgresql/data     -Fp -Xs -P -R   >/dev/null
