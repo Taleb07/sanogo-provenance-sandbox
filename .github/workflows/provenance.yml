@@ -172,6 +172,30 @@ jobs:
           jq -e 'length > 0' evidence/sbom-verification.json >/dev/null
           echo "HOSTED_SBOM_ATTESTATION_VERIFY_RC=0"
 
+      - name: Prove wrong workflow identity is denied
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +e
+          gh attestation verify \
+            dist/sanogo-provenance-artifact.tar \
+            --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --format json \
+            --deny-self-hosted-runners \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/not-authorized.yml" \
+            > evidence/wrong-workflow-verification.txt 2>&1
+          RC=$?
+          set -e
+
+          cat evidence/wrong-workflow-verification.txt
+          echo "HOSTED_WRONG_WORKFLOW_VERIFY_RC=$RC"
+          test "$RC" -ne 0
+
       - name: Prove tampered artifact is denied
         shell: bash
         env:
@@ -216,7 +240,7 @@ jobs:
               synthetic_only: true
             }' > evidence/hosted-evidence.json
 
-          sha256sum             dist/sanogo-provenance-artifact.tar             dist/sbom.spdx.json             evidence/hosted-evidence.json             evidence/source.sha256             evidence/provenance-verification.json             evidence/sbom-verification.json             evidence/tamper-verification.txt             > evidence/EVIDENCE_SHA256SUMS.txt
+          sha256sum             dist/sanogo-provenance-artifact.tar             dist/sbom.spdx.json             evidence/hosted-evidence.json             evidence/source.sha256             evidence/provenance-verification.json             evidence/sbom-verification.json             evidence/wrong-workflow-verification.txt             evidence/tamper-verification.txt             > evidence/EVIDENCE_SHA256SUMS.txt
 
           cat evidence/hosted-evidence.json
           cat evidence/EVIDENCE_SHA256SUMS.txt
