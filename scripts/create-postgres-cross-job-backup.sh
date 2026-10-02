@@ -52,7 +52,7 @@ cat > "$OUTDIR/backup-manifest.json" <<JSON
 }
 JSON
 
-sha256sum "$OUTDIR/postgres.dump" "$OUTDIR/expected_rows.txt" "$OUTDIR/backup-manifest.json" > "$OUTDIR/SHA256SUMS.txt"
+(cd "$OUTDIR" && sha256sum postgres.dump expected_rows.txt backup-manifest.json > SHA256SUMS.txt)
 
 echo "CROSS_JOB_BACKUP_CREATED_RC=0"
 echo "CROSS_JOB_BACKUP_SHA256=$BACKUP_SHA256"
