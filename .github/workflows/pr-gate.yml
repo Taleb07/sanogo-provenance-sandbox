@@ -1,0 +1,102 @@
+name: SANOGO PR Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanogo-pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout exact PR merge candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify clean workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          sha256sum artifact.txt scripts/build.sh .github/workflows/provenance.yml .github/workflows/pr-gate.yml
+
+      - name: Deterministic build twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist1 dist2
+          bash scripts/build.sh dist1
+          bash scripts/build.sh dist2
+
+          D1="$(sha256sum dist1/sanogo-provenance-artifact.tar | awk '{print $1}')"
+          D2="$(sha256sum dist2/sanogo-provenance-artifact.tar | awk '{print $1}')"
+
+          echo "PR_BUILD1_SHA256=$D1"
+          echo "PR_BUILD2_SHA256=$D2"
+
+          test "$D1" = "$D2"
+          echo "PR_REPRODUCIBLE_RC=0"
+
+      - name: Generate and verify minimal SPDX binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          cp dist1/sanogo-provenance-artifact.tar dist/
+
+          ARTIFACT_SHA="$(sha256sum dist/sanogo-provenance-artifact.tar | awk '{print $1}')"
+          SOURCE_SHA256="$(sha256sum artifact.txt | awk '{print $1}')"
+
+          jq -n             --arg artifact "$ARTIFACT_SHA"             --arg source "$SOURCE_SHA256"             '{
+              spdxVersion: "SPDX-2.3",
+              dataLicense: "CC0-1.0",
+              SPDXID: "SPDXRef-DOCUMENT",
+              name: "SANOGO-PR-Gate-SBOM",
+              documentNamespace: ("https://sanogo.invalid/spdx/pr-gate/" + $artifact),
+              creationInfo: {
+                created: "1970-01-01T00:00:00Z",
+                creators: ["Tool: SANOGO PR Gate"]
+              },
+              packages: [{
+                name: "sanogo-pr-gate-artifact",
+                SPDXID: "SPDXRef-Package",
+                downloadLocation: "NOASSERTION",
+                filesAnalyzed: false,
+                checksums: [{algorithm: "SHA256", checksumValue: $artifact}],
+                licenseConcluded: "NOASSERTION",
+                licenseDeclared: "NOASSERTION",
+                copyrightText: "NOASSERTION"
+              }],
+              files: [{
+                fileName: "./artifact.txt",
+                SPDXID: "SPDXRef-File-artifact",
+                checksums: [{algorithm: "SHA256", checksumValue: $source}],
+                licenseConcluded: "NOASSERTION",
+                copyrightText: "NOASSERTION"
+              }]
+            }' > dist/pr-gate-sbom.spdx.json
+
+          jq empty dist/pr-gate-sbom.spdx.json
+
+          SBOM_SOURCE_SHA="$(jq -r '.files[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' dist/pr-gate-sbom.spdx.json)"
+          SBOM_ARTIFACT_SHA="$(jq -r '.packages[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' dist/pr-gate-sbom.spdx.json)"
+
+          test "$SBOM_SOURCE_SHA" = "$SOURCE_SHA256"
+          test "$SBOM_ARTIFACT_SHA" = "$ARTIFACT_SHA"
+
+          echo "PR_SBOM_SOURCE_BINDING_RC=0"
+          echo "PR_SBOM_ARTIFACT_BINDING_RC=0"
