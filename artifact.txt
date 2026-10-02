@@ -3,3 +3,4 @@ artifact=hosted-provenance-test
 version=1.0.0
 environment=SANDBOX
 data=SYNTHETIC_ONLY
+pr_gate_probe=1
