@@ -156,7 +156,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh attestation verify             dist/sanogo-provenance-artifact.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             2>&1 | tee evidence/attestation-verification.txt
+          gh attestation verify             dist/sanogo-provenance-artifact.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-repo "$GITHUB_REPOSITORY"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/provenance.yml"             > evidence/provenance-verification.json
+
+          jq -e 'length > 0' evidence/provenance-verification.json >/dev/null
+          echo "HOSTED_PROVENANCE_VERIFY_RC=0"
+
+      - name: Verify SBOM attestation through GitHub attestation service
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify             dist/sanogo-provenance-artifact.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://spdx.dev/Document/v2.3             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-repo "$GITHUB_REPOSITORY"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/provenance.yml"             > evidence/sbom-verification.json
+
+          jq -e 'length > 0' evidence/sbom-verification.json >/dev/null
+          echo "HOSTED_SBOM_ATTESTATION_VERIFY_RC=0"
 
       - name: Prove tampered artifact is denied
         shell: bash
@@ -168,7 +182,7 @@ jobs:
           printf 'TAMPER' >> dist/tampered.tar
 
           set +e
-          gh attestation verify             dist/tampered.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             > evidence/tamper-verification.txt 2>&1
+          gh attestation verify             dist/tampered.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             --format json             --deny-self-hosted-runners             --source-digest "$GITHUB_SHA"             --source-ref "$GITHUB_REF"             --signer-repo "$GITHUB_REPOSITORY"             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/provenance.yml"             > evidence/tamper-verification.txt 2>&1
           RC=$?
           set -e
 
@@ -194,10 +208,15 @@ jobs:
               sbom_sha256: $sbom_sha256,
               provenance_attestation_url: $provenance_url,
               sbom_attestation_url: $sbom_attestation_url,
+              action_pins: {
+                checkout: "3d3c42e5aac5ba805825da76410c181273ba90b1",
+                attest: "1e69f48acb82d1966a394da916b4c1698aa569d6",
+                upload_artifact: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+              },
               synthetic_only: true
             }' > evidence/hosted-evidence.json
 
-          sha256sum             dist/sanogo-provenance-artifact.tar             dist/sbom.spdx.json             evidence/hosted-evidence.json             evidence/source.sha256             evidence/attestation-verification.txt             > evidence/EVIDENCE_SHA256SUMS.txt
+          sha256sum             dist/sanogo-provenance-artifact.tar             dist/sbom.spdx.json             evidence/hosted-evidence.json             evidence/source.sha256             evidence/provenance-verification.json             evidence/sbom-verification.json             evidence/tamper-verification.txt             > evidence/EVIDENCE_SHA256SUMS.txt
 
           cat evidence/hosted-evidence.json
           cat evidence/EVIDENCE_SHA256SUMS.txt
