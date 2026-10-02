@@ -84,10 +84,10 @@ CREATE TABLE IF NOT EXISTS ha_probe(id integer primary key, marker text not null
 INSERT INTO ha_probe VALUES (1,'before-failover') ON CONFLICT (id) DO UPDATE SET marker=excluded.marker;
 SQL
 
-TARGET_LSN="$(docker exec ha-primary psql -U postgres -Atqc "select pg_current_wal_flush_lsn();")"
+BARRIER_LSN="$(docker exec ha-primary psql -U postgres -Atqc "select pg_create_restore_point('sanogo_ha_probe_barrier');")"
 REPLAY_REACHED="f"
 for _ in $(seq 1 60); do
-  REPLAY_REACHED="$(docker exec ha-standby psql -U postgres -Atqc "select coalesce(pg_last_wal_replay_lsn() >= '$TARGET_LSN'::pg_lsn,false);" 2>/dev/null || true)"
+  REPLAY_REACHED="$(docker exec ha-standby psql -U postgres -Atqc "select coalesce(pg_last_wal_replay_lsn() >= '$BARRIER_LSN'::pg_lsn,false);" 2>/dev/null || true)"
   if [ "$REPLAY_REACHED" = "t" ]; then
     break
   fi
@@ -95,14 +95,25 @@ for _ in $(seq 1 60); do
 done
 
 if [ "$REPLAY_REACHED" != "t" ]; then
-  echo "HA_REPLAY_TARGET_TIMEOUT=1" >&2
-  docker exec ha-primary psql -U postgres -c "select application_name,state,sent_lsn,write_lsn,flush_lsn,replay_lsn,sync_state from pg_stat_replication;" >&2 || true
-  docker exec ha-standby psql -U postgres -c "select pg_is_in_recovery(),pg_is_wal_replay_paused(),pg_last_wal_receive_lsn(),pg_last_wal_replay_lsn();" >&2 || true
+  echo "HA_REPLAY_BARRIER_TIMEOUT=1" >&2
+  echo "HA_BARRIER_LSN=$BARRIER_LSN" >&2
+  docker exec ha-primary psql -U postgres -c "select current_database(),application_name,state,sent_lsn,write_lsn,flush_lsn,replay_lsn,sync_state from pg_stat_replication;" >&2 || true
+  docker exec ha-standby psql -U postgres -c "select current_database(),pg_is_in_recovery(),pg_is_wal_replay_paused(),pg_last_wal_receive_lsn(),pg_last_wal_replay_lsn(),to_regclass('public.ha_probe');" >&2 || true
   docker logs --tail 80 ha-standby >&2 || true
   exit 31
 fi
 
-MARKER="$(docker exec ha-standby psql -U postgres -Atqc "select marker from ha_probe where id=1;")"
+RELATION="$(docker exec ha-standby psql -U postgres -Atqc "select coalesce(to_regclass('public.ha_probe')::text,'');")"
+if [ "$RELATION" != "ha_probe" ]; then
+  echo "HA_RELATION_NOT_VISIBLE_AFTER_BARRIER=1" >&2
+  echo "HA_BARRIER_LSN=$BARRIER_LSN" >&2
+  docker exec ha-primary psql -U postgres -c "select current_database(),to_regclass('public.ha_probe'),pg_current_wal_flush_lsn();" >&2 || true
+  docker exec ha-standby psql -U postgres -c "select current_database(),pg_is_in_recovery(),pg_last_wal_receive_lsn(),pg_last_wal_replay_lsn(),to_regclass('public.ha_probe');" >&2 || true
+  docker logs --tail 80 ha-standby >&2 || true
+  exit 32
+fi
+
+MARKER="$(docker exec ha-standby psql -U postgres -Atqc "select marker from public.ha_probe where id=1;")"
 test "$MARKER" = "before-failover"
 test "$(docker exec ha-standby psql -U postgres -Atqc "select pg_is_in_recovery();")" = "t"
 echo "HA_REPLICATION_LSN_REPLAY_RC=0"
