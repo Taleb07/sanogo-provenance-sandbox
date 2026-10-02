@@ -79,10 +79,9 @@ echo "HA_STREAMING_REPLICATION_RC=0"
 
 docker exec ha-standby psql -U postgres -v ON_ERROR_STOP=1 -c "select pg_wal_replay_resume();" >/dev/null
 
-docker exec ha-primary psql -U postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
-CREATE TABLE IF NOT EXISTS ha_probe(id integer primary key, marker text not null);
-INSERT INTO ha_probe VALUES (1,'before-failover') ON CONFLICT (id) DO UPDATE SET marker=excluded.marker;
-SQL
+PRIMARY_MARKER="$(docker exec ha-primary psql -U postgres -Atv ON_ERROR_STOP=1 -c "CREATE TABLE IF NOT EXISTS public.ha_probe(id integer primary key, marker text not null); INSERT INTO public.ha_probe VALUES (1,'before-failover') ON CONFLICT (id) DO UPDATE SET marker=excluded.marker; SELECT marker FROM public.ha_probe WHERE id=1;")"
+test "$PRIMARY_MARKER" = "before-failover"
+echo "HA_PRIMARY_PROBE_WRITE_RC=0"
 
 BARRIER_LSN="$(docker exec ha-primary psql -U postgres -Atqc "select pg_create_restore_point('sanogo_ha_probe_barrier');")"
 REPLAY_REACHED="f"
@@ -132,11 +131,9 @@ echo "=== PITR: start archive-enabled primary ==="
 docker run -d --name pitr-primary --network "$NET" --read-only --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID --pids-limit 256 --memory 512m --cpus 1 -e POSTGRES_PASSWORD_FILE=/run/secrets/db_password -e POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256" -v sanogo-pitr-primary:/var/lib/postgresql/data -v sanogo-pitr-archive:/archive -v "$DB_SECRET:/run/secrets/db_password:ro" --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --tmpfs /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m "$PG_IMAGE" postgres -c wal_level=replica -c archive_mode=on -c archive_timeout=1 -c "archive_command=test ! -f /archive/%f && cp %p /archive/%f" >/dev/null
 wait_pg pitr-primary
 
-docker exec pitr-primary psql -U postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
-CREATE TABLE pitr_probe(id integer primary key, marker text not null);
-INSERT INTO pitr_probe VALUES (1,'keep-before-target');
-CHECKPOINT;
-SQL
+PITR_PRIMARY_MARKER="$(docker exec pitr-primary psql -U postgres -Atv ON_ERROR_STOP=1 -c "CREATE TABLE public.pitr_probe(id integer primary key, marker text not null); INSERT INTO public.pitr_probe VALUES (1,'keep-before-target'); CHECKPOINT; SELECT marker FROM public.pitr_probe WHERE id=1;")"
+test "$PITR_PRIMARY_MARKER" = "keep-before-target"
+echo "PITR_PRIMARY_PROBE_WRITE_RC=0"
 
 echo "=== PITR: take physical base backup ==="
 printf 'pitr-primary:*:*:postgres:%s\n' "$DB_PASS" | docker run --rm -i --network "$NET" --user postgres --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1m,mode=1777 -e PGPASSFILE=/tmp/pgpass -v sanogo-pitr-base:/var/lib/postgresql/data "$PG_IMAGE" sh -ceu 'umask 077; cat > /tmp/pgpass; pg_basebackup -h pitr-primary -U postgres -D /var/lib/postgresql/data -Fp -Xs -P' >/dev/null
