@@ -1,0 +1,215 @@
+name: SANOGO Hosted Provenance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - artifact.txt
+      - scripts/**
+      - .github/workflows/provenance.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: sanogo-provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  hosted-provenance:
+    name: Hosted provenance and attestation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify source identity and cleanliness
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -p evidence
+          sha256sum artifact.txt scripts/build.sh .github/workflows/provenance.yml | tee evidence/source.sha256
+
+      - name: Build twice deterministically
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist1 dist2 dist
+          bash scripts/build.sh dist1
+          bash scripts/build.sh dist2
+
+          D1="$(sha256sum dist1/sanogo-provenance-artifact.tar | awk '{print $1}')"
+          D2="$(sha256sum dist2/sanogo-provenance-artifact.tar | awk '{print $1}')"
+
+          echo "BUILD1_SHA256=$D1"
+          echo "BUILD2_SHA256=$D2"
+
+          test "$D1" = "$D2"
+          echo "HOSTED_REPRODUCIBLE_RC=0"
+
+          mkdir -p dist
+          cp dist1/sanogo-provenance-artifact.tar dist/
+          printf '%s  %s\n' "$D1" "sanogo-provenance-artifact.tar" > dist/SHA256SUMS
+
+      - name: Generate SPDX SBOM bound to artifact and source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_SHA="$(sha256sum dist/sanogo-provenance-artifact.tar | awk '{print $1}')"
+          SOURCE_SHA256="$(sha256sum artifact.txt | awk '{print $1}')"
+          SOURCE_SHA1="$(sha1sum artifact.txt | awk '{print $1}')"
+          PVC="$(printf '%s' "$SOURCE_SHA1" | sha1sum | awk '{print $1}')"
+
+          jq -n             --arg commit "$GITHUB_SHA"             --arg artifact "$ARTIFACT_SHA"             --arg source256 "$SOURCE_SHA256"             --arg source1 "$SOURCE_SHA1"             --arg pvc "$PVC"             '{
+              spdxVersion: "SPDX-2.3",
+              dataLicense: "CC0-1.0",
+              SPDXID: "SPDXRef-DOCUMENT",
+              name: "SANOGO-hosted-provenance-SBOM",
+              documentNamespace: ("https://sanogo.invalid/spdx/hosted/" + $commit + "/" + $artifact),
+              creationInfo: {
+                created: "1970-01-01T00:00:00Z",
+                creators: ["Tool: SANOGO GitHub Actions hosted provenance sandbox"]
+              },
+              packages: [{
+                name: "sanogo-hosted-provenance-artifact",
+                SPDXID: "SPDXRef-Package",
+                versionInfo: "1.0.0",
+                downloadLocation: "NOASSERTION",
+                filesAnalyzed: true,
+                packageVerificationCode: {packageVerificationCodeValue: $pvc},
+                checksums: [{algorithm: "SHA256", checksumValue: $artifact}],
+                licenseConcluded: "NOASSERTION",
+                licenseDeclared: "NOASSERTION",
+                copyrightText: "NOASSERTION"
+              }],
+              files: [{
+                fileName: "./artifact.txt",
+                SPDXID: "SPDXRef-File-artifact",
+                checksums: [
+                  {algorithm: "SHA1", checksumValue: $source1},
+                  {algorithm: "SHA256", checksumValue: $source256}
+                ],
+                licenseConcluded: "NOASSERTION",
+                copyrightText: "NOASSERTION"
+              }],
+              relationships: [
+                {
+                  spdxElementId: "SPDXRef-DOCUMENT",
+                  relationshipType: "DESCRIBES",
+                  relatedSpdxElement: "SPDXRef-Package"
+                },
+                {
+                  spdxElementId: "SPDXRef-Package",
+                  relationshipType: "CONTAINS",
+                  relatedSpdxElement: "SPDXRef-File-artifact"
+                }
+              ]
+            }' > dist/sbom.spdx.json
+
+          jq empty dist/sbom.spdx.json
+          sha256sum dist/sbom.spdx.json | tee evidence/sbom.sha256
+
+      - name: Verify SBOM bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REAL_SOURCE_SHA="$(sha256sum artifact.txt | awk '{print $1}')"
+          SBOM_SOURCE_SHA="$(jq -r '.files[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' dist/sbom.spdx.json)"
+          test "$REAL_SOURCE_SHA" = "$SBOM_SOURCE_SHA"
+
+          REAL_ARTIFACT_SHA="$(sha256sum dist/sanogo-provenance-artifact.tar | awk '{print $1}')"
+          SBOM_ARTIFACT_SHA="$(jq -r '.packages[0].checksums[] | select(.algorithm=="SHA256") | .checksumValue' dist/sbom.spdx.json)"
+          test "$REAL_ARTIFACT_SHA" = "$SBOM_ARTIFACT_SHA"
+
+          echo "HOSTED_SBOM_SOURCE_BINDING_RC=0"
+          echo "HOSTED_SBOM_ARTIFACT_BINDING_RC=0"
+
+      - name: Generate hosted build provenance attestation
+        id: provenance
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: ${{ github.workspace }}/dist/sanogo-provenance-artifact.tar
+
+      - name: Generate hosted SBOM attestation
+        id: sbom-attestation
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: ${{ github.workspace }}/dist/sanogo-provenance-artifact.tar
+          sbom-path: ${{ github.workspace }}/dist/sbom.spdx.json
+
+      - name: Verify provenance through GitHub attestation service
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify             dist/sanogo-provenance-artifact.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             | tee evidence/attestation-verification.txt
+
+      - name: Prove tampered artifact is denied
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp dist/sanogo-provenance-artifact.tar dist/tampered.tar
+          printf 'TAMPER' >> dist/tampered.tar
+
+          set +e
+          gh attestation verify             dist/tampered.tar             --repo "$GITHUB_REPOSITORY"             --predicate-type https://slsa.dev/provenance/v1             > evidence/tamper-verification.txt 2>&1
+          RC=$?
+          set -e
+
+          cat evidence/tamper-verification.txt
+          echo "HOSTED_TAMPER_VERIFY_RC=$RC"
+          test "$RC" -ne 0
+
+      - name: Record hosted evidence manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_SHA="$(sha256sum dist/sanogo-provenance-artifact.tar | awk '{print $1}')"
+          SBOM_SHA="$(sha256sum dist/sbom.spdx.json | awk '{print $1}')"
+
+          jq -n             --arg repository "$GITHUB_REPOSITORY"             --arg commit "$GITHUB_SHA"             --arg workflow "$GITHUB_WORKFLOW_REF"             --arg run_id "$GITHUB_RUN_ID"             --arg run_attempt "$GITHUB_RUN_ATTEMPT"             --arg runner_os "$RUNNER_OS"             --arg runner_arch "$RUNNER_ARCH"             --arg artifact_sha256 "$ARTIFACT_SHA"             --arg sbom_sha256 "$SBOM_SHA"             --arg provenance_url "${{ steps.provenance.outputs.attestation-url }}"             --arg sbom_attestation_url "${{ steps.sbom-attestation.outputs.attestation-url }}"             '{
+              repository: $repository,
+              commit: $commit,
+              workflow: $workflow,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              runner: {os: $runner_os, arch: $runner_arch},
+              artifact_sha256: $artifact_sha256,
+              sbom_sha256: $sbom_sha256,
+              provenance_attestation_url: $provenance_url,
+              sbom_attestation_url: $sbom_attestation_url,
+              synthetic_only: true
+            }' > evidence/hosted-evidence.json
+
+          sha256sum             dist/sanogo-provenance-artifact.tar             dist/sbom.spdx.json             evidence/hosted-evidence.json             evidence/source.sha256             evidence/attestation-verification.txt             > evidence/EVIDENCE_SHA256SUMS.txt
+
+          cat evidence/hosted-evidence.json
+          cat evidence/EVIDENCE_SHA256SUMS.txt
+
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sanogo-hosted-provenance-evidence
+          path: |
+            dist/sanogo-provenance-artifact.tar
+            dist/SHA256SUMS
+            dist/sbom.spdx.json
+            evidence/
+          if-no-files-found: error
+          retention-days: 7
