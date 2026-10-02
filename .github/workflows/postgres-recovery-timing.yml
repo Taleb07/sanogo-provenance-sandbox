@@ -1,0 +1,71 @@
+name: SANOGO PostgreSQL Recovery Timing Sandbox
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/test-postgres-recovery-timing.sh
+      - .github/workflows/postgres-recovery-timing.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanogo-postgres-recovery-timing-main
+  cancel-in-progress: true
+
+jobs:
+  postgres-recovery-timing:
+    name: postgres-recovery-timing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          sha256sum scripts/test-postgres-recovery-timing.sh .github/workflows/postgres-recovery-timing.yml
+
+      - name: Measure controlled PostgreSQL recovery timings
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-postgres-recovery-timing.sh | tee postgres-recovery-timing.log
+
+      - name: Build evidence summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp postgres-recovery-timing.log evidence/postgres-recovery-timing.log 2>/dev/null || true
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "commit=$GITHUB_SHA"
+            echo "workflow=$GITHUB_WORKFLOW_REF"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "postgres_image=postgres@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
+            echo "contractual_rpo_rto_claim=false"
+          } > evidence/context.txt
+          grep -E '^(DB_FAILOVER_RECOVERY_MS|CONTROLLED_FAILOVER_DATA_LOSS_ROWS|PITR_RESTORE_MS)=' postgres-recovery-timing.log > evidence/recovery-metrics.env 2>/dev/null || true
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+
+      - name: Upload recovery timing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-recovery-timing-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
