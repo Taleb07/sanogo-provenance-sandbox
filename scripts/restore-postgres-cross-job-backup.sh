@@ -45,8 +45,7 @@ for _ in $(seq 1 90); do
 done
 docker exec backup-restore pg_isready -U postgres >/dev/null
 
-docker cp "$INPUT/postgres.dump" backup-restore:/tmp/postgres.dump
-docker exec backup-restore pg_restore -U postgres -d postgres --clean --if-exists /tmp/postgres.dump >/dev/null
+cat "$INPUT/postgres.dump" | docker exec -i backup-restore pg_restore -U postgres -d postgres --clean --if-exists >/dev/null
 
 ACTUAL_ROWS="$(docker exec backup-restore psql -U postgres -qAt -F '|' -c "select id,tenant_id,marker from public.backup_probe order by id;")"
 printf '%s\n' "$ACTUAL_ROWS" > "$WORKDIR/actual_rows.txt"
