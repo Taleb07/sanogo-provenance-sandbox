@@ -77,21 +77,35 @@ done
 test "$STATE" = "streaming"
 echo "HA_STREAMING_REPLICATION_RC=0"
 
+docker exec ha-standby psql -U postgres -v ON_ERROR_STOP=1 -c "select pg_wal_replay_resume();" >/dev/null
+
 docker exec ha-primary psql -U postgres -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 CREATE TABLE IF NOT EXISTS ha_probe(id integer primary key, marker text not null);
 INSERT INTO ha_probe VALUES (1,'before-failover') ON CONFLICT (id) DO UPDATE SET marker=excluded.marker;
 SQL
 
-MARKER=""
+TARGET_LSN="$(docker exec ha-primary psql -U postgres -Atqc "select pg_current_wal_flush_lsn();")"
+REPLAY_REACHED="f"
 for _ in $(seq 1 60); do
-  MARKER="$(docker exec ha-standby psql -U postgres -Atqc "select marker from ha_probe where id=1;" 2>/dev/null || true)"
-  if [ "$MARKER" = "before-failover" ]; then
+  REPLAY_REACHED="$(docker exec ha-standby psql -U postgres -Atqc "select coalesce(pg_last_wal_replay_lsn() >= '$TARGET_LSN'::pg_lsn,false);" 2>/dev/null || true)"
+  if [ "$REPLAY_REACHED" = "t" ]; then
     break
   fi
   sleep 1
 done
+
+if [ "$REPLAY_REACHED" != "t" ]; then
+  echo "HA_REPLAY_TARGET_TIMEOUT=1" >&2
+  docker exec ha-primary psql -U postgres -c "select application_name,state,sent_lsn,write_lsn,flush_lsn,replay_lsn,sync_state from pg_stat_replication;" >&2 || true
+  docker exec ha-standby psql -U postgres -c "select pg_is_in_recovery(),pg_is_wal_replay_paused(),pg_last_wal_receive_lsn(),pg_last_wal_replay_lsn();" >&2 || true
+  docker logs --tail 80 ha-standby >&2 || true
+  exit 31
+fi
+
+MARKER="$(docker exec ha-standby psql -U postgres -Atqc "select marker from ha_probe where id=1;")"
 test "$MARKER" = "before-failover"
 test "$(docker exec ha-standby psql -U postgres -Atqc "select pg_is_in_recovery();")" = "t"
+echo "HA_REPLICATION_LSN_REPLAY_RC=0"
 echo "HA_REPLICATION_DATA_BINDING_RC=0"
 
 echo "=== HA: fail primary and promote standby ==="
