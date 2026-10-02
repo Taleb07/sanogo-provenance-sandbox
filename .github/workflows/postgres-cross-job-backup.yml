@@ -1,0 +1,102 @@
+name: SANOGO PostgreSQL Cross-Job Backup Restore Sandbox
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/create-postgres-cross-job-backup.sh
+      - scripts/restore-postgres-cross-job-backup.sh
+      - .github/workflows/postgres-cross-job-backup.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-backup:
+    name: create-backup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Create synthetic PostgreSQL backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/create-postgres-cross-job-backup.sh backup-output | tee create-backup.log
+
+      - name: Upload backup as cross-job artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-cross-job-backup
+          path: backup-output/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload creation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-cross-job-backup-create-evidence
+          path: create-backup.log
+          if-no-files-found: error
+          retention-days: 7
+
+  restore-backup:
+    name: restore-backup
+    needs: create-backup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout exact triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download backup from prior job
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: postgres-cross-job-backup
+          path: downloaded-backup
+
+      - name: Restore into a fresh PostgreSQL instance and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/restore-postgres-cross-job-backup.sh downloaded-backup | tee restore-backup.log
+
+      - name: Build final evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp restore-backup.log evidence/
+          cp downloaded-backup/backup-manifest.json evidence/
+          cp downloaded-backup/SHA256SUMS.txt evidence/
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "commit=$GITHUB_SHA"
+            echo "workflow=$GITHUB_WORKFLOW_REF"
+            echo "source_job=create-backup"
+            echo "restore_job=restore-backup"
+            echo "source_container_reused=false"
+            echo "source_volume_reused=false"
+            echo "artifact_retention_days=7"
+            echo "production_backup_durability_claim=false"
+          } > evidence/context.txt
+          sha256sum evidence/* > evidence/EVIDENCE_SHA256SUMS.txt
+
+      - name: Upload restore evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-cross-job-restore-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
