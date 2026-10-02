@@ -27,6 +27,7 @@ jobs:
       artifact-metadata: write
     outputs:
       digest: ${{ steps.subject.outputs.digest }}
+      source_sha256: ${{ steps.subject.outputs.source_sha256 }}
 
     steps:
       - name: Checkout exact triggering commit
@@ -141,7 +142,9 @@ jobs:
         run: |
           set -euo pipefail
           DIGEST="$(jq -r '."containerimage.digest"' build-metadata.json)"
+          SOURCE_SHA256="$(sha256sum artifact.txt | awk '{print $1}')"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "source_sha256=$SOURCE_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Generate registry provenance attestation
         id: provenance
@@ -299,5 +302,105 @@ jobs:
         with:
           name: registry-promotion-evidence
           path: evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy-dry-run:
+    name: deploy-dry-run
+    needs: [build-publish, promote-staging]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DIGEST: ${{ needs.build-publish.outputs.digest }}
+      SOURCE_SHA256: ${{ needs.build-publish.outputs.source_sha256 }}
+
+    steps:
+      - name: Login to GHCR read-only
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Enforce provenance before deployment dry-run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+
+          gh attestation verify \
+            "oci://$IMAGE@$DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --format json \
+            --deny-self-hosted-runners \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/registry-promotion.yml" \
+            > evidence/deploy-provenance-verification.json
+
+          jq -e 'length > 0' evidence/deploy-provenance-verification.json >/dev/null
+          echo "DEPLOY_ATTESTATION_GATE_RC=0"
+
+      - name: Pull immutable digest and verify deployed content
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker pull "$IMAGE@$DIGEST"
+
+          PULLED_DIGEST="$(docker buildx imagetools inspect "$IMAGE@$DIGEST" | awk '$1=="Digest:" {print $2; exit}')"
+          test "$PULLED_DIGEST" = "$DIGEST"
+
+          CID="$(docker create "$IMAGE@$DIGEST" /bin/true)"
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+          docker cp "$CID:/artifact.txt" deployed-artifact.txt
+          ACTUAL_SOURCE_SHA256="$(sha256sum deployed-artifact.txt | awk '{print $1}')"
+          test "$ACTUAL_SOURCE_SHA256" = "$SOURCE_SHA256"
+
+          echo "DEPLOY_BY_DIGEST_RC=0"
+          echo "DEPLOY_CONTENT_BINDING_RC=0"
+
+      - name: Record deployment dry-run evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg commit "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg digest "$DIGEST" \
+            --arg source_sha256 "$SOURCE_SHA256" \
+            '{
+              repository: $repository,
+              commit: $commit,
+              image: $image,
+              deployed_by_digest: $digest,
+              expected_source_sha256: $source_sha256,
+              provenance_verified_before_pull: true,
+              registry_write_permission: false,
+              attestation_write_permission: false,
+              production_deployment_performed: false,
+              execution_mode: "sandbox-dry-run",
+              synthetic_only: true
+            }' > evidence/deploy-dry-run-evidence.json
+
+          cat evidence/deploy-dry-run-evidence.json
+
+      - name: Upload deployment dry-run evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-deploy-dry-run-evidence
+          path: |
+            evidence/
+            deployed-artifact.txt
           if-no-files-found: error
           retention-days: 7
